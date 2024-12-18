@@ -1,0 +1,126 @@
+import csv
+import json
+import subprocess
+from datetime import datetime, timezone
+from urllib.parse import quote
+
+# Function to load API keys from a file
+def load_api_keys(filename):
+    api_keys = {}
+    with open(filename, 'r') as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                function_name, key = line.split(':', 1)
+                api_keys[function_name] = key.strip()
+    return api_keys
+
+# Function to convert epoch time to readable UTC timestamp
+def convert_epoch_to_timestamp(epoch_time):
+    return datetime.fromtimestamp(int(epoch_time), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+# Function to safely convert data to JSON
+def safe_json_dumps(data):
+    try:
+        return json.dumps(data)
+    except Exception as e:
+        print("JSON Error:", e, data)
+        return "{}"
+
+# Function to execute curl command and get raw JSON data
+def execute_curl_and_get_data(curl_command):
+    result = subprocess.run(curl_command, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error executing curl command: {result.stderr}")
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON response: {e}")
+        return None
+
+# Function to fetch and write raw Prometheus data to CSV
+def fetch_raw_metrics(input_files, api_keys, output_file):
+    start_epoch = '1734310800'  # Example start time (replace with dynamic if needed)
+    end_epoch = '1734318000'    # Example end time
+    step = '1h'
+
+    data_rows = []
+
+    # Open CSV file to write raw results
+    with open(output_file, mode='w', newline='') as csv_file:
+        fieldnames = ["metric_name", "FQDN", "event_time", "value", "labels"]
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        # Process each file
+        for input_file, function_name in input_files.items():
+            encoded_api_key = api_keys.get(function_name)
+            if not encoded_api_key:
+                print(f"Skipping {function_name} due to missing API key.")
+                continue
+
+            with open(input_file, 'r') as file:
+                for metric_name in file:
+                    metric_name = metric_name.strip()
+                    if not metric_name:
+                        continue
+
+                    # Simple query without aggregation functions
+                    query = f'{metric_name}'
+                    encoded_query = quote(query)
+                    curl_command = (
+                        f"curl --location --globoff \"https://us.aether.nss.vzwnet.com/gem/prometheus/api/v1/query_range?"
+                        f"query={encoded_query}&start={start_epoch}&end={end_epoch}&step={step}\""
+                        f" --header \"Authorization: Basic {encoded_api_key}\""
+                    )
+
+                    print(f"Executing query for {metric_name}:\n{curl_command}\n")
+                    response_data = execute_curl_and_get_data(curl_command)
+
+                    if not response_data or response_data.get('status') != 'success':
+                        print(f"No data found for {metric_name}.")
+                        continue
+
+                    # Process raw results
+                    for result in response_data['data']['result']:
+                        fqdn = result['metric'].get('kubernetes_namespace', result['metric'].get('localdn', 'unknown'))
+                        labels = result['metric']  # All labels included, no exclusions
+
+                        for value in result['values']:
+                            event_time = convert_epoch_to_timestamp(value[0])
+                            metric_value = value[1]
+                            data_rows.append({
+                                "metric_name": metric_name,
+                                "FQDN": fqdn,
+                                "event_time": event_time,
+                                "value": metric_value,
+                                "labels": safe_json_dumps(labels)
+                            })
+                            writer.writerow({
+                                "metric_name": metric_name,
+                                "FQDN": fqdn,
+                                "event_time": event_time,
+                                "value": metric_value,
+                                "labels": safe_json_dumps(labels)
+                            })
+
+    print(f"Raw data written to CSV: {output_file}")
+
+# Main execution block
+if __name__ == "__main__":
+    # Input files mapping to their respective functions
+    input_files = {
+        "smf_metrics.txt": "smf",
+        "upf_metrics.txt": "upf",
+    }
+
+    # API keys file
+    api_keys_file = "api_keys.txt"
+
+    # Output CSV file
+    output_file = "raw_metrics_results.csv"
+
+    # Load API keys and fetch raw metrics
+    api_keys = load_api_keys(api_keys_file)
+    fetch_raw_metrics(input_files, api_keys, output_file)
