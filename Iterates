@@ -1,0 +1,118 @@
+import csv
+import json
+import subprocess
+from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
+
+def load_api_keys(filename):
+    api_keys = {}
+    with open(filename, 'r') as file:
+        for line in file:
+            if line.strip():
+                function_name, key = line.strip().split(':', 1)
+                api_keys[function_name] = key.strip()
+    return api_keys
+
+def convert_epoch_to_timestamp(epoch_time):
+    return datetime.fromtimestamp(int(epoch_time), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+def extract_date_from_timestamp(timestamp):
+    return timestamp.split(' ')[0]
+
+def safe_json_dumps(data):
+    try:
+        return json.dumps(data)
+    except Exception as e:
+        print("JSON Error:", e, data)
+        return "{}"
+
+def execute_curl(curl_command):
+    result = subprocess.run(curl_command, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Curl command failed: {result.stderr}")
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("Failed to parse JSON from response.")
+        return None
+
+def fetch_raw_metric_data(curl_command, metric_name):
+    response = execute_curl(curl_command)
+    if not response or response.get('status') != 'success':
+        print(f"No data returned for {metric_name}")
+        return []
+
+    rows = []
+    for result in response['data']['result']:
+        labels = result.get('metric', {})
+        fqdn = labels.get('kubernetes_namespace') or labels.get('localdn') or 'unknown'
+        for value in result.get('values', []):
+            timestamp = convert_epoch_to_timestamp(value[0])
+            transdt = extract_date_from_timestamp(timestamp)
+            raw_value = value[1]
+            rows.append({
+                "metric_name": metric_name,
+                "FQDN": fqdn,
+                "labels": safe_json_dumps(labels),
+                "event_time": timestamp,
+                "transdt": transdt,
+                "raw_value": raw_value
+            })
+    return rows
+
+def generate_hourly_intervals(start_epoch_str, end_epoch_str):
+    start = datetime.utcfromtimestamp(int(start_epoch_str))
+    end = datetime.utcfromtimestamp(int(end_epoch_str))
+    intervals = []
+
+    current = start
+    while current < end:
+        next_hour = current + timedelta(hours=1)
+        intervals.append((int(current.timestamp()), int(next_hour.timestamp())))
+        current = next_hour
+
+    return intervals
+
+def process_raw_metrics(input_file, api_key, output_file, start_epoch_str, end_epoch_str):
+    step = '1m'
+    intervals = generate_hourly_intervals(start_epoch_str, end_epoch_str)
+
+    with open(input_file, 'r') as f:
+        metrics = [line.strip() for line in f if line.strip()]
+
+    with open(output_file, 'w', newline='') as csvfile:
+        fieldnames = ["metric_name", "FQDN", "labels", "event_time", "transdt", "raw_value"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for metric_name in metrics:
+            for start, end in intervals:
+                query = f'{metric_name} offset -1h'
+                curl_cmd = (
+                    f"curl --location --globoff \"https://us.aether.nss.vzwnet.com/gem/prometheus/api/v1/query_range?"
+                    f"query={quote(query)}&start={start}&end={end}&step={step}\" "
+                    f"--header \"Authorization: Basic {api_key}\""
+                )
+                print(f"Fetching {metric_name} from {start} to {end}...")
+                rows = fetch_raw_metric_data(curl_cmd, metric_name)
+                for row in rows:
+                    writer.writerow(row)
+
+    print(f"✅ Raw metric data written to {output_file}")
+
+# === MAIN ===
+if __name__ == "__main__":
+    metric_file = "smf_metrics.txt"
+    api_keys = load_api_keys("api_keys.txt")
+    api_key = api_keys.get("smf")
+    output_csv = "smf_raw_data_hourly.csv"
+
+    # Example: Feb 21 - Feb 28, 2025
+    start_epoch = '1740096000'
+    end_epoch = '1740783600'
+
+    if api_key:
+        process_raw_metrics(metric_file, api_key, output_csv, start_epoch, end_epoch)
+    else:
+        print("SMF API key not found. Please check api_keys.txt")
